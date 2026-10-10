@@ -151,6 +151,8 @@ class MarantzV2007Receiver:
         self, port: str, *, model: V2007Model = V2007Model.GENERIC
     ) -> None:
         self._port = port
+        # ESPHome proxy URLs can carry the API key in the query string
+        self._log_port = port.split("?", 1)[0]
         self._model = model
         self._reader: asyncio.StreamReader | None = None
         self._writer: serialx.SerialStreamWriter | None = None
@@ -238,7 +240,7 @@ class MarantzV2007Receiver:
             power = await self._query("PWR")
             if power not in (V2007Power.ON.value, V2007Power.OFF.value):
                 raise ConnectionError(
-                    f"Invalid power response from receiver on {self._port}: {power!r}"
+                    f"Invalid power response from receiver on {self._log_port}: {power!r}"
                 )
 
             # Enable auto status feedback (all four layers) so subscribers see
@@ -247,7 +249,7 @@ class MarantzV2007Receiver:
         except TimeoutError:
             await self.disconnect()
             raise ConnectionError(
-                f"No response from receiver on {self._port}"
+                f"No response from receiver on {self._log_port}"
             ) from None
         except BaseException:
             await self.disconnect()
@@ -255,7 +257,7 @@ class MarantzV2007Receiver:
 
         _LOGGER.info(
             "Connected to v2007 Marantz receiver on %s (model=%s)",
-            self._port,
+            self._log_port,
             self._model.value,
         )
 

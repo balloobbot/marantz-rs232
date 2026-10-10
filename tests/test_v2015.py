@@ -1,6 +1,7 @@
 """Tests for marantz_rs232 query, control, and event handling."""
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -291,6 +292,48 @@ async def test_connect_timeout_raises():
     ):
         with pytest.raises(ConnectionError, match="No response"):
             await recv.connect()
+
+
+ESPHOME_PORT = "esphome://proxy.local:6053/?port_name=RS232&key=SECRET"
+
+
+async def test_connect_keeps_api_key_out_of_logs(
+    mock_serial: MockSerialConnection, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    recv = MarantzV2015Receiver(ESPHOME_PORT)
+
+    async def fake_open(*args, **kwargs):
+        return mock_serial.reader, mock_serial.writer
+
+    mock_serial._query_responses = {"PW": ["PWON"]}
+
+    with patch(
+        "marantz_rs232.v2015.receiver.serialx.open_serial_connection",
+        side_effect=fake_open,
+    ):
+        await recv.connect()
+
+    assert "esphome://proxy.local:6053/" in caplog.text
+    assert "SECRET" not in caplog.text
+    await recv.disconnect()
+
+
+async def test_connect_error_keeps_api_key_out_of_message():
+    recv = MarantzV2015Receiver(ESPHOME_PORT)
+    mock = MockSerialConnection()
+
+    async def fake_open(*args, **kwargs):
+        return mock.reader, mock.writer
+
+    with patch(
+        "marantz_rs232.v2015.receiver.serialx.open_serial_connection",
+        side_effect=fake_open,
+    ):
+        with pytest.raises(ConnectionError) as exc_info:
+            await recv.connect()
+
+    assert "SECRET" not in str(exc_info.value)
 
 
 @pytest.mark.parametrize("power", ["OFF", "UNKNOWN"])

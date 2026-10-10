@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -402,6 +403,22 @@ async def test_connect_raises_on_no_response() -> None:
         rcv = MarantzV2003Receiver("/dev/null")
         with pytest.raises(ConnectionError):
             await rcv.connect()
+
+
+async def test_connect_error_keeps_api_key_out_of_message() -> None:
+    silent = _MockV2003Serial()
+    silent.query_responses = {}  # never respond
+    with patch(
+        "marantz_rs232.v2003.receiver.serialx.open_serial_connection",
+        AsyncMock(return_value=(silent.reader, silent.writer)),
+    ):
+        rcv = MarantzV2003Receiver(
+            "esphome://proxy.local:6053/?port_name=RS232&key=SECRET"
+        )
+        with pytest.raises(ConnectionError) as exc_info:
+            await rcv.connect()
+
+    assert "SECRET" not in str(exc_info.value)
 
 
 @pytest.mark.parametrize("power", ["A2", "Aunknown"])

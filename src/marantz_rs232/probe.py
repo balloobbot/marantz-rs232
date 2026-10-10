@@ -46,6 +46,9 @@ async def probe(port: str, *, timeout: float = PROBE_TIMEOUT) -> ReceiverClass:
     """
     from .v2015 import MarantzV2015Receiver  # local to avoid import cycle
 
+    # ESPHome proxy URLs can carry the API key in the query string
+    log_port = port.split("?", 1)[0]
+
     # Phase 1: v2007 / v2015 at 9600 baud, no hardware flow control.
     reader, writer = await serialx.open_serial_connection(port, baudrate=V2015_BAUD_RATE)
     try:
@@ -61,10 +64,10 @@ async def probe(port: str, *, timeout: float = PROBE_TIMEOUT) -> ReceiverClass:
         await writer.wait_closed()
 
     if byte == b"@":
-        _LOGGER.info("Detected v2007 protocol on %s", port)
+        _LOGGER.info("Detected v2007 protocol on %s", log_port)
         return MarantzV2007Receiver
     if byte:
-        _LOGGER.info("Detected v2015 protocol on %s (first byte %r)", port, byte)
+        _LOGGER.info("Detected v2015 protocol on %s (first byte %r)", log_port, byte)
         return MarantzV2015Receiver
 
     # Phase 2: v2003 at 4800 baud with RTS/CTS.
@@ -78,16 +81,16 @@ async def probe(port: str, *, timeout: float = PROBE_TIMEOUT) -> ReceiverClass:
             byte = await asyncio.wait_for(reader.readexactly(1), timeout=timeout)
         except (asyncio.TimeoutError, asyncio.IncompleteReadError) as err:
             raise ConnectionError(
-                f"No response from receiver on {port} (probed v2007/v2015 at 9600 and v2003 at 4800)"
+                f"No response from receiver on {log_port} (probed v2007/v2015 at 9600 and v2003 at 4800)"
             ) from err
     finally:
         writer.close()
         await writer.wait_closed()
 
     if byte == b"@":
-        _LOGGER.info("Detected v2003 protocol on %s", port)
+        _LOGGER.info("Detected v2003 protocol on %s", log_port)
         return MarantzV2003Receiver
 
     raise ConnectionError(
-        f"Unrecognized response on {port} at 4800 baud: {byte!r}"
+        f"Unrecognized response on {log_port} at 4800 baud: {byte!r}"
     )
