@@ -10,6 +10,7 @@ import pytest
 
 import marantz_rs232.v2003.receiver as v2003_receiver
 from marantz_rs232 import (
+    MarantzConnectionError,
     MarantzV2003Receiver,
     V2003DisplayMode,
     V2003InputMode,
@@ -490,6 +491,103 @@ async def test_disconnect_notifies_subscribers() -> None:
         rcv.subscribe(events.append)
         await rcv.disconnect()
         assert events[-1] is None
+
+
+def _break_transport(mock: _MockV2003Serial) -> OSError:
+    """Make the mock transport behave like a serial link that has gone away.
+
+    Writes fail, and so does ``wait_closed()``: serialx re-raises the error
+    that broke the connection when the stream is closed afterwards.
+    """
+    err = OSError(5, "ESPHome API connection closed")
+    mock.writer.write.side_effect = err
+    mock.writer.wait_closed.side_effect = err
+    return err
+
+
+async def test_write_error_on_broken_transport_tears_down(
+    receiver: MarantzV2003Receiver, mock_serial: _MockV2003Serial
+) -> None:
+    """A failed write tears down instead of leaving a dead writer behind."""
+    events: list[V2003ReceiverState | None] = []
+    receiver.subscribe(events.append)
+    err = _break_transport(mock_serial)
+
+    with pytest.raises(MarantzConnectionError) as exc_info:
+        await receiver.main.power_on()
+
+    assert exc_info.value.__cause__ is err
+    assert not receiver.connected
+    assert receiver._writer is None
+    assert receiver._read_task is None
+    assert receiver._pending_ack is None
+    assert events == [None]
+
+    # Later commands fail fast instead of writing to the dead stream again.
+    mock_serial.writer.write.reset_mock()
+    with pytest.raises(MarantzConnectionError, match="Not connected"):
+        await receiver.main.power_on()
+    with pytest.raises(MarantzConnectionError, match="Not connected"):
+        await receiver._query("A")
+    mock_serial.writer.write.assert_not_called()
+
+
+async def test_eof_tears_down_and_allows_reconnect(
+    receiver: MarantzV2003Receiver, mock_serial: _MockV2003Serial
+) -> None:
+    """A closed link disconnects, so connect() can open it again."""
+    events: list[V2003ReceiverState | None] = []
+    receiver.subscribe(events.append)
+    read_task = receiver._read_task
+    assert read_task is not None
+
+    mock_serial.reader.feed_eof()
+    await read_task
+
+    assert not receiver.connected
+    assert receiver._writer is None
+    assert events == [None]
+
+    fresh = _MockV2003Serial()
+    fresh.query_responses = dict(_DEFAULT_V2003_RESPONSES)
+    with patch(
+        "marantz_rs232.v2003.receiver.serialx.open_serial_connection",
+        AsyncMock(return_value=(fresh.reader, fresh.writer)),
+    ):
+        await receiver.connect()
+
+    assert receiver.connected
+    await receiver.main.power_on()
+    assert fresh.command_log == [V2003Power.ON.value]
+
+
+async def test_link_loss_fails_command_in_flight(
+    receiver: MarantzV2003Receiver, mock_serial: _MockV2003Serial
+) -> None:
+    """A dropped link fails the pending command instead of timing out."""
+    mock_serial.writer.write.side_effect = lambda _data: mock_serial.reader.feed_eof()
+
+    with pytest.raises(MarantzConnectionError, match="Connection lost"):
+        await receiver.main.power_on()
+
+    assert not receiver.connected
+
+
+async def test_read_loop_error_tears_down(
+    receiver: MarantzV2003Receiver,
+    mock_serial: _MockV2003Serial,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unexpected error in the read loop disconnects instead of hanging."""
+    read_task = receiver._read_task
+    assert read_task is not None
+
+    with patch.object(receiver, "_dispatch", side_effect=RuntimeError("boom")):
+        mock_serial.feed_status("A0")
+        await read_task
+
+    assert not receiver.connected
+    assert "Error reading from serial port" in caplog.text
 
 
 # -- query_state / state updates ----------------------------------------------

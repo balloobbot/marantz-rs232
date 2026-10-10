@@ -8,6 +8,7 @@ from collections.abc import Callable
 
 import serialx
 
+from ..exceptions import MarantzConnectionError
 from .const import (
     V2007_BAUD_RATE,
     V2007_COMMAND_TIMEOUT,
@@ -154,6 +155,7 @@ class MarantzV2007Receiver:
         self._reader: asyncio.StreamReader | None = None
         self._writer: serialx.SerialStreamWriter | None = None
         self._read_task: asyncio.Task | None = None
+        self._teardown_task: asyncio.Task | None = None
         self._state = V2007ReceiverState()
         self.main = V2007MainPlayer(self, self._state.main)
         self.multi_room_a = V2007MultiRoomPlayer(
@@ -204,16 +206,33 @@ class MarantzV2007Receiver:
         return self._state.main.power
 
     def subscribe(self, callback: V2007StateCallback) -> Callable[[], None]:
+        """Subscribe to state changes. Returns an unsubscribe function.
+
+        Calling the unsubscribe function more than once is a no-op.
+        """
         self._subscribers.append(callback)
-        return lambda: self._subscribers.remove(callback)
+
+        def unsubscribe() -> None:
+            if callback in self._subscribers:
+                self._subscribers.remove(callback)
+
+        return unsubscribe
 
     async def connect(self) -> None:
+        """Open the serial connection.
+
+        Raises ``RuntimeError`` if already connected. Call ``disconnect()``
+        first to reconnect.
+        """
+        if self._connected:
+            raise RuntimeError("Already connected")
         self._reader, self._writer = await serialx.open_serial_connection(
             self._port,
             baudrate=V2007_BAUD_RATE,
         )
         self._connected = True
         self._read_task = asyncio.create_task(self._read_loop())
+        self._read_task.add_done_callback(self._on_read_task_done)
 
         try:
             power = await self._query("PWR")
@@ -281,21 +300,13 @@ class MarantzV2007Receiver:
     async def _send_command(
         self, prefix: str, payload: str, *, separator: str = ":"
     ) -> None:
-        assert self._writer is not None
         if separator == "=":
             self._check_models("Multi Room B (`=` separator)", V2007_MULTI_ROOM_B_MODELS)
             msg = encode_set_command_b(prefix, payload)
         else:
             msg = encode_set_command(prefix, payload)
         _LOGGER.debug("Sending: %s", msg)
-        try:
-            async with self._write_lock:
-                self._writer.write(msg)
-                await self._writer.drain()
-        except Exception:
-            _LOGGER.exception("Error writing to serial port")
-            await self._teardown()
-            raise
+        await self._write(msg)
 
     async def _query(
         self,
@@ -304,7 +315,6 @@ class MarantzV2007Receiver:
         separator: str = ":",
         response_prefix: str | None = None,
     ) -> str:
-        assert self._writer is not None
         loop = asyncio.get_running_loop()
         future: asyncio.Future[str] = loop.create_future()
         # `response_prefix` lets queries like `@HAL:?` listen for a response
@@ -314,7 +324,6 @@ class MarantzV2007Receiver:
             future=future,
             separator=separator,
         )
-        self._pending_queries.append(pending)
 
         try:
             if separator == "=":
@@ -336,49 +345,92 @@ class MarantzV2007Receiver:
             else:
                 msg = encode_query(prefix)
             _LOGGER.debug("Querying: %s", msg)
-            try:
-                async with self._write_lock:
-                    self._writer.write(msg)
-                    await self._writer.drain()
-            except Exception:
-                _LOGGER.exception("Error writing to serial port")
-                await self._teardown()
-                raise
+            await self._write(msg, pending)
             return await asyncio.wait_for(future, timeout=V2007_COMMAND_TIMEOUT)
         finally:
             if pending in self._pending_queries:
                 self._pending_queries.remove(pending)
 
+    async def _write(self, msg: bytes, pending: PendingQuery | None = None) -> None:
+        """Write ``msg`` and register ``pending`` to receive its reply."""
+        async with self._write_lock:
+            if not self._connected or self._writer is None:
+                raise MarantzConnectionError("Not connected")
+            if pending is not None:
+                self._pending_queries.append(pending)
+            try:
+                self._writer.write(msg)
+                await self._writer.drain()
+            except Exception as err:
+                _LOGGER.exception("Error writing to serial port")
+                # Nobody awaits the reply once the write fails, so do not let
+                # _teardown() fail it.
+                if pending in self._pending_queries:
+                    self._pending_queries.remove(pending)
+                await self._teardown()
+                raise MarantzConnectionError(
+                    f"Error writing to serial port: {err}"
+                ) from err
+
     async def _teardown(self) -> None:
+        """Tear down the connection.
+
+        The reader, writer and read task are dropped before anything is
+        awaited, so a failure while closing an already-broken transport
+        cannot leave a dead stream behind for later commands to write to.
+        """
         if not self._connected:
             return
         self._connected = False
 
-        current = asyncio.current_task()
+        read_task, self._read_task = self._read_task, None
+        writer, self._writer = self._writer, None
+        self._reader = None
 
-        if self._read_task is not None and self._read_task is not current:
-            self._read_task.cancel()
+        # The receiver can no longer answer, so fail the queries in flight now
+        # instead of letting them time out.
+        pending_queries, self._pending_queries = self._pending_queries, []
+        for pending in pending_queries:
+            if not pending.future.done():
+                pending.future.set_exception(MarantzConnectionError("Connection lost"))
+
+        if read_task is not None and read_task is not asyncio.current_task():
+            read_task.cancel()
             try:
-                await self._read_task
+                await read_task
             except asyncio.CancelledError:
                 pass
-        self._read_task = None
 
-        if self._writer is not None:
-            self._writer.close()
-            await self._writer.wait_closed()
-            self._writer = None
-            self._reader = None
+        if writer is not None:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                # The transport is already gone (e.g. the ESPHome proxy lost
+                # its API connection); there is nothing left to clean up.
+                _LOGGER.debug("Error closing serial port", exc_info=True)
 
         self._notify_subscribers()
 
+    def _on_read_task_done(self, task: asyncio.Task) -> None:
+        """Tear down the connection if the read loop died with an error."""
+        if task.cancelled() or (err := task.exception()) is None:
+            return
+        _LOGGER.error("Read loop failed", exc_info=err)
+        if self._read_task is not task:
+            return
+        # _teardown() would await the task and re-raise its error.
+        self._read_task = None
+        self._teardown_task = asyncio.get_running_loop().create_task(self._teardown())
+
     async def _read_loop(self) -> None:
-        assert self._reader is not None
+        reader = self._reader
+        assert reader is not None
         buf = b""
 
         while self._connected:
             try:
-                data = await self._reader.read(256)
+                data = await reader.read(256)
             except Exception:
                 if not self._connected:
                     return
@@ -868,7 +920,7 @@ class MarantzV2007Receiver:
 
     def _notify_subscribers(self) -> None:
         state = self._state.copy() if self._connected else None
-        for callback in self._subscribers:
+        for callback in list(self._subscribers):
             try:
                 callback(state)
             except Exception:

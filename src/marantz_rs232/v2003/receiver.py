@@ -22,6 +22,7 @@ from collections.abc import Callable
 
 import serialx
 
+from ..exceptions import MarantzConnectionError
 from .const import (
     ACK_BYTE,
     DEFAULT_DEVICE_ID,
@@ -154,6 +155,7 @@ class MarantzV2003Receiver:
             baudrate=V2003_BAUD_RATE,
             rtscts=True,
         )
+        self._connected = True
         self._read_task = asyncio.create_task(self._read_loop())
         # Verify the link by querying power. If the receiver doesn't answer
         # within COMMAND_TIMEOUT we treat it as a connection failure.
@@ -171,25 +173,47 @@ class MarantzV2003Receiver:
         except BaseException:
             await self.disconnect()
             raise
-        self._connected = True
 
     async def disconnect(self) -> None:
-        if self._read_task is not None:
-            self._read_task.cancel()
-            try:
-                await self._read_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._read_task = None
-        if self._writer is not None:
-            try:
-                self._writer.close()
-                await self._writer.wait_closed()
-            except Exception:  # pragma: no cover - best-effort teardown
-                pass
-            self._writer = None
-        self._reader = None
+        await self._teardown()
+
+    async def _teardown(self) -> None:
+        """Tear down the connection.
+
+        The reader, writer and read task are dropped before anything is
+        awaited, so a failure while closing an already-broken transport
+        cannot leave a dead stream behind for later commands to write to.
+        """
+        if not self._connected:
+            return
         self._connected = False
+
+        read_task, self._read_task = self._read_task, None
+        writer, self._writer = self._writer, None
+        self._reader = None
+
+        # The receiver can no longer answer, so fail the request in flight now
+        # instead of letting it time out.
+        for future in (self._pending_ack, self._pending_query_future):
+            if future is not None and not future.done():
+                future.set_exception(MarantzConnectionError("Connection lost"))
+
+        if read_task is not None and read_task is not asyncio.current_task():
+            read_task.cancel()
+            try:
+                await read_task
+            except asyncio.CancelledError:
+                pass
+
+        if writer is not None:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                # The transport is already gone (e.g. the ESPHome proxy lost
+                # its API connection); there is nothing left to clean up.
+                _LOGGER.debug("Error closing serial port", exc_info=True)
+
         self._notify(None)
 
     # -- Public API --
@@ -223,14 +247,11 @@ class MarantzV2003Receiver:
 
     async def _send_command(self, code: str) -> None:
         """Send a normal command and await the ACK byte."""
-        if self._writer is None:
-            raise ConnectionError("Receiver is not connected")
         loop = asyncio.get_running_loop()
         async with self._send_lock:
             self._pending_ack = loop.create_future()
-            self._writer.write(encode_command(self._device_id, code))
-            await self._writer.drain()
             try:
+                await self._write(encode_command(self._device_id, code))
                 ok = await asyncio.wait_for(
                     self._pending_ack, timeout=V2003_COMMAND_TIMEOUT
                 )
@@ -242,15 +263,12 @@ class MarantzV2003Receiver:
     async def _query(self, request_char: str) -> str:
         """Send a status request and return the answer payload (without the
         leading ``@<ID>``)."""
-        if self._writer is None:
-            raise ConnectionError("Receiver is not connected")
         loop = asyncio.get_running_loop()
         async with self._send_lock:
             self._pending_query_char = request_char
             self._pending_query_future = loop.create_future()
             try:
-                self._writer.write(encode_query(self._device_id, request_char))
-                await self._writer.drain()
+                await self._write(encode_query(self._device_id, request_char))
                 payload = await asyncio.wait_for(
                     self._pending_query_future, timeout=V2003_COMMAND_TIMEOUT
                 )
@@ -259,29 +277,48 @@ class MarantzV2003Receiver:
                 self._pending_query_future = None
         return payload
 
+    async def _write(self, msg: bytes) -> None:
+        """Write a request. Caller must hold ``self._send_lock``."""
+        if not self._connected or self._writer is None:
+            raise MarantzConnectionError("Not connected")
+        try:
+            self._writer.write(msg)
+            await self._writer.drain()
+        except Exception as err:
+            _LOGGER.exception("Error writing to serial port")
+            # Nobody awaits the response once the write fails, so do not let
+            # _teardown() fail it.
+            self._pending_ack = None
+            self._pending_query_future = None
+            await self._teardown()
+            raise MarantzConnectionError(
+                f"Error writing to serial port: {err}"
+            ) from err
+
     # -- Read loop --
 
     async def _read_loop(self) -> None:
-        assert self._reader is not None
+        reader = self._reader
+        assert reader is not None
         try:
             while True:
-                byte = await self._reader.read(1)
+                byte = await reader.read(1)
                 if not byte:
-                    break  # EOF — port closed
+                    _LOGGER.warning("Serial connection closed")
+                    break
                 if byte == ACK_BYTE:
                     self._resolve_ack(True)
                 elif byte == NAK_BYTE:
                     self._resolve_ack(False)
                 elif byte == b"@":
-                    rest = await self._reader.readuntil(V2003_TERMINATOR)
+                    rest = await reader.readuntil(V2003_TERMINATOR)
                     line = (byte + rest).decode("ascii", errors="replace").rstrip()
                     self._dispatch(line)
                 else:
                     _LOGGER.debug("Discarding unexpected byte: %r", byte)
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # pragma: no cover
-            _LOGGER.exception("v2003 read loop crashed")
+        except Exception:
+            _LOGGER.exception("Error reading from serial port")
+        await self._teardown()
 
     def _resolve_ack(self, ok: bool) -> None:
         fut = self._pending_ack

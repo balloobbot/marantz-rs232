@@ -12,6 +12,7 @@ from conftest import (
 )
 
 from marantz_rs232 import (
+    MarantzConnectionError,
     _V2015_MULTI_RESPONSE_PREFIXES,
     _V2015_SINGLE_RESPONSE_PREFIXES,
     V2015AspectMode,
@@ -1615,6 +1616,120 @@ async def test_disconnect_notifies_none(receiver, mock_serial):
     await receiver.disconnect()
 
     assert states[-1] is None
+
+
+def _break_transport(mock: MockSerialConnection) -> OSError:
+    """Make the mock transport behave like a serial link that has gone away.
+
+    Writes fail, and so does ``wait_closed()``: serialx re-raises the error
+    that broke the connection when the stream is closed afterwards.
+    """
+    err = OSError(5, "ESPHome API connection closed")
+    mock.writer.write.side_effect = err
+    mock.writer.wait_closed.side_effect = err
+    return err
+
+
+async def test_write_error_on_broken_transport_tears_down(receiver, mock_serial):
+    """A transport that also fails on close must not leave a dead writer behind."""
+    states = []
+    receiver.subscribe(states.append)
+    err = _break_transport(mock_serial)
+
+    with pytest.raises(MarantzConnectionError) as exc_info:
+        await receiver.power_on()
+
+    assert exc_info.value.__cause__ is err
+    assert not receiver.connected
+    assert receiver._writer is None
+    assert receiver._read_task is None
+    assert states == [None]
+
+    # Later commands fail fast instead of writing to the dead stream again.
+    mock_serial.writer.write.reset_mock()
+    with pytest.raises(MarantzConnectionError, match="Not connected"):
+        await receiver.power_on()
+    with pytest.raises(MarantzConnectionError, match="Not connected"):
+        await receiver.query_power()
+    mock_serial.writer.write.assert_not_called()
+
+
+async def test_read_error_on_broken_transport_tears_down(receiver, mock_serial):
+    """The read loop must finish cleanly even when closing the transport fails."""
+    states = []
+    receiver.subscribe(states.append)
+    read_task = receiver._read_task
+    err = _break_transport(mock_serial)
+
+    mock_serial.reader.set_exception(err)
+    await read_task
+
+    assert not receiver.connected
+    assert receiver._writer is None
+    assert states == [None]
+
+
+async def test_link_loss_fails_query_in_flight(receiver, mock_serial):
+    """A dropped link fails the pending query instead of timing out."""
+    mock_serial.writer.write.side_effect = lambda _data: mock_serial.reader.feed_eof()
+
+    with pytest.raises(MarantzConnectionError, match="Connection lost"):
+        await receiver.query_power()
+
+    assert not receiver.connected
+
+
+async def test_read_loop_crash_tears_down(receiver, mock_serial, caplog):
+    """An unexpected error in the read loop disconnects instead of hanging."""
+    disconnected = asyncio.Event()
+    receiver.subscribe(lambda state: state is None and disconnected.set())
+
+    with patch.object(receiver, "_process_message", side_effect=RuntimeError("boom")):
+        mock_serial.inject_response("MV75")
+        await disconnected.wait()
+
+    assert not receiver.connected
+    assert "Read loop failed" in caplog.text
+
+
+async def test_connect_when_connected_raises(receiver, mock_serial):
+    """A second connect() must not replace and leak the open connection."""
+    with (
+        patch(
+            "marantz_rs232.v2015.receiver.serialx.open_serial_connection"
+        ) as mock_open,
+        pytest.raises(RuntimeError, match="Already connected"),
+    ):
+        await receiver.connect()
+
+    mock_open.assert_not_called()
+    mock_serial.writer.close.assert_not_called()
+    assert receiver.connected
+    await receiver.power_on()
+
+
+async def test_unsubscribe_twice_is_noop(receiver, mock_serial):
+    states = []
+    unsubscribe = receiver.subscribe(states.append)
+
+    unsubscribe()
+    unsubscribe()
+
+    mock_serial.inject_response("MV75")
+    await asyncio.sleep(0.1)
+    assert states == []
+
+
+async def test_unsubscribe_during_callback_keeps_other_subscribers(
+    receiver, mock_serial
+):
+    states = []
+    unsubscribe = receiver.subscribe(lambda _state: unsubscribe())
+    receiver.subscribe(states.append)
+
+    mock_serial.inject_response("MV75")
+    await asyncio.sleep(0.1)
+    assert len(states) == 1
 
 
 # ============================================================
