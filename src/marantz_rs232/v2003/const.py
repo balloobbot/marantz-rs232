@@ -19,6 +19,9 @@ from enum import Enum
 
 V2003_BAUD_RATE = 4800
 V2003_COMMAND_TIMEOUT = 1.5  # spec says 1 s; give a small margin
+# Seconds the next command waits after a timeout, so a late ACK/NAK for the
+# timed-out command is dropped instead of answering the next one.
+V2003_LATE_RESPONSE_WINDOW = 1.0
 V2003_PREFIX = "@"
 V2003_TERMINATOR = b"\r"
 

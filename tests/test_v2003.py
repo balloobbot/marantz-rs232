@@ -50,6 +50,7 @@ from marantz_rs232.v2003.protocol import (
 
 # Speed up the command timeout for the test suite.
 v2003_receiver.V2003_COMMAND_TIMEOUT = 0.05
+v2003_receiver.V2003_LATE_RESPONSE_WINDOW = 0.1
 
 
 # -- Wire encoding ------------------------------------------------------------
@@ -830,6 +831,27 @@ async def test_command_nak_raises(
     mock_serial.command_response = b"\x15"  # NAK
     with pytest.raises(ValueError):
         await receiver.main.power_on()
+
+
+async def test_late_ack_not_credited_to_next_command(
+    receiver: MarantzV2003Receiver, mock_serial: _MockV2003Serial
+) -> None:
+    """An ACK that misses the timeout must not answer the next command."""
+    loop = asyncio.get_running_loop()
+    # power_on: the ACK only arrives after the command timed out.
+    # power_off: the receiver answers in order, so its NAK follows the late ACK.
+    replies = iter([(0.08, b"\x06"), (0.04, b"\x15")])
+
+    def on_write(data: bytes) -> None:
+        delay, reply = next(replies)
+        loop.call_later(delay, mock_serial.feed_bytes, reply)
+
+    mock_serial.writer.write.side_effect = on_write
+
+    with pytest.raises(TimeoutError):
+        await receiver.main.power_on()
+    with pytest.raises(ValueError):
+        await receiver.main.power_off()
 
 
 async def test_subscriber_called_on_state_change(

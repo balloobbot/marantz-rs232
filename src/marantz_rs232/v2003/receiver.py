@@ -31,6 +31,7 @@ from .const import (
     SURROUND_STATUS_CODES,
     V2003_BAUD_RATE,
     V2003_COMMAND_TIMEOUT,
+    V2003_LATE_RESPONSE_WINDOW,
     V2003_TERMINATOR,
     V2003DisplayMode,
     V2003InputMode,
@@ -138,6 +139,9 @@ class MarantzV2003Receiver:
         self._read_task: asyncio.Task[None] | None = None
         self._send_lock = asyncio.Lock()
         self._pending_ack: asyncio.Future[bool] | None = None
+        # Loop time until which a late ACK/NAK for a timed-out command may
+        # still arrive; protected by _send_lock.
+        self._late_response_deadline = 0.0
         self._pending_query_char: str | None = None
         self._pending_query_future: asyncio.Future[str] | None = None
         self._state = V2003ReceiverState(device_id=device_id)
@@ -248,15 +252,28 @@ class MarantzV2003Receiver:
     # -- Internal: send / query --
 
     async def _send_command(self, code: str) -> None:
-        """Send a normal command and await the ACK byte."""
+        """Send a normal command and await the ACK byte.
+
+        ACK and NAK are bare bytes, so they are credited to whichever command
+        is pending when they arrive. After a timeout, the next command waits
+        until ``V2003_LATE_RESPONSE_WINDOW`` has passed before it writes. A
+        late ACK/NAK in that window finds no pending command and is dropped.
+        """
         loop = asyncio.get_running_loop()
         async with self._send_lock:
+            if (delay := self._late_response_deadline - loop.time()) > 0:
+                await asyncio.sleep(delay)
             self._pending_ack = loop.create_future()
             try:
                 await self._write(encode_command(self._device_id, code))
                 ok = await asyncio.wait_for(
                     self._pending_ack, timeout=V2003_COMMAND_TIMEOUT
                 )
+            except TimeoutError:
+                self._late_response_deadline = (
+                    loop.time() + V2003_LATE_RESPONSE_WINDOW
+                )
+                raise
             finally:
                 self._pending_ack = None
         if not ok:
