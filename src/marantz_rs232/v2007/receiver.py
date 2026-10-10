@@ -216,12 +216,7 @@ class MarantzV2007Receiver:
         self._read_task = asyncio.create_task(self._read_loop())
 
         try:
-            try:
-                power = await self._query("PWR")
-            except TimeoutError:
-                raise ConnectionError(
-                    f"No response from receiver on {self._port}"
-                ) from None
+            power = await self._query("PWR")
             if power not in (V2007Power.ON.value, V2007Power.OFF.value):
                 raise ConnectionError(
                     f"Invalid power response from receiver on {self._port}: {power!r}"
@@ -229,12 +224,12 @@ class MarantzV2007Receiver:
 
             # Enable auto status feedback (all four layers) so subscribers see
             # spontaneous state changes.
-            try:
-                await self._send_command("AST", "F")
-            except Exception:
-                if not self.connected:
-                    raise
-                _LOGGER.warning("Failed to enable auto status feedback", exc_info=True)
+            await self._send_command("AST", "F")
+        except TimeoutError:
+            await self.disconnect()
+            raise ConnectionError(
+                f"No response from receiver on {self._port}"
+            ) from None
         except BaseException:
             await self.disconnect()
             raise

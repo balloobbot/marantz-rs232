@@ -197,13 +197,16 @@ def test_state_copy():
 # -- Connection tests --
 
 
-async def test_connect_verifies_power(mock_serial):
+@pytest.mark.parametrize("power, expected", [("ON", True), ("STANDBY", False)])
+async def test_connect_verifies_power(
+    mock_serial: MockSerialConnection, power: str, expected: bool
+) -> None:
     recv = MarantzV2015Receiver("/dev/ttyUSB0")
 
     async def fake_open(*args, **kwargs):
         return mock_serial.reader, mock_serial.writer
 
-    mock_serial._query_responses = dict(DEFAULT_QUERY_RESPONSES)
+    mock_serial._query_responses = {"PW": [f"PW{power}"]}
 
     with patch(
         "marantz_rs232.v2015.receiver.serialx.open_serial_connection",
@@ -211,7 +214,7 @@ async def test_connect_verifies_power(mock_serial):
     ):
         await recv.connect()
 
-    assert recv.state.power is True
+    assert recv.state.power is expected
     sent_queries = [data.decode("ascii") for data in mock_serial.written_data]
     assert sent_queries == ["PW?\r"]
 
@@ -287,6 +290,70 @@ async def test_connect_timeout_raises():
     ):
         with pytest.raises(ConnectionError, match="No response"):
             await recv.connect()
+
+
+@pytest.mark.parametrize("power", ["OFF", "UNKNOWN"])
+async def test_connect_invalid_power_closes_connection(
+    mock_serial: MockSerialConnection, power: str
+) -> None:
+    recv = MarantzV2015Receiver("/dev/ttyUSB0")
+    mock_serial._query_responses = {"PW": [f"PW{power}"]}
+    with patch(
+        "marantz_rs232.v2015.receiver.serialx.open_serial_connection",
+        return_value=(mock_serial.reader, mock_serial.writer),
+    ):
+        with pytest.raises(ValueError):
+            await recv.connect()
+    assert not recv.connected
+    mock_serial.writer.close.assert_called_once()
+    mock_serial.writer.wait_closed.assert_awaited_once()
+    assert recv._read_task is None
+    assert not recv._pending_queries
+
+
+async def test_connect_cancellation_closes_connection(
+    mock_serial: MockSerialConnection,
+) -> None:
+    recv = MarantzV2015Receiver("/dev/ttyUSB0")
+    draining = asyncio.Event()
+
+    async def drain() -> None:
+        draining.set()
+        await asyncio.Event().wait()
+
+    mock_serial.writer.drain.side_effect = drain
+    with patch(
+        "marantz_rs232.v2015.receiver.serialx.open_serial_connection",
+        return_value=(mock_serial.reader, mock_serial.writer),
+    ):
+        task = asyncio.create_task(recv.connect())
+        await draining.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert not recv.connected
+    mock_serial.writer.close.assert_called_once()
+    mock_serial.writer.wait_closed.assert_awaited_once()
+    assert recv._read_task is None
+    assert not recv._pending_queries
+
+
+async def test_connect_write_failure_closes_connection(
+    mock_serial: MockSerialConnection,
+) -> None:
+    recv = MarantzV2015Receiver("/dev/ttyUSB0")
+    mock_serial.writer.drain.side_effect = OSError("Write failed")
+    with patch(
+        "marantz_rs232.v2015.receiver.serialx.open_serial_connection",
+        return_value=(mock_serial.reader, mock_serial.writer),
+    ):
+        with pytest.raises(OSError, match="Write failed"):
+            await recv.connect()
+    assert not recv.connected
+    mock_serial.writer.close.assert_called_once()
+    mock_serial.writer.wait_closed.assert_awaited_once()
+    assert recv._read_task is None
+    assert not recv._pending_queries
 
 
 async def test_disconnect(receiver):

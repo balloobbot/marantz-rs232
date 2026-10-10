@@ -158,12 +158,19 @@ class MarantzV2003Receiver:
         # Verify the link by querying power. If the receiver doesn't answer
         # within COMMAND_TIMEOUT we treat it as a connection failure.
         try:
-            await self._query("A")
-        except (asyncio.TimeoutError, ConnectionError) as err:
+            power = await self._query("A")
+            if power not in POWER_STATUS_CODES:
+                raise ConnectionError(
+                    f"Invalid power response from receiver on {self._port}: {power!r}"
+                )
+        except TimeoutError as err:
             await self.disconnect()
             raise ConnectionError(
                 f"No response from v2003 receiver on {self._port}: {err}"
             ) from err
+        except BaseException:
+            await self.disconnect()
+            raise
         self._connected = True
 
     async def disconnect(self) -> None:
@@ -241,9 +248,9 @@ class MarantzV2003Receiver:
         async with self._send_lock:
             self._pending_query_char = request_char
             self._pending_query_future = loop.create_future()
-            self._writer.write(encode_query(self._device_id, request_char))
-            await self._writer.drain()
             try:
+                self._writer.write(encode_query(self._device_id, request_char))
+                await self._writer.drain()
                 payload = await asyncio.wait_for(
                     self._pending_query_future, timeout=V2003_COMMAND_TIMEOUT
                 )

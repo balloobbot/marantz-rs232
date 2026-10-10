@@ -131,6 +131,9 @@ class MarantzV2015Receiver:
             raise ConnectionError(
                 f"No response from receiver on {self._port}"
             ) from None
+        except BaseException:
+            await self.disconnect()
+            raise
 
         _LOGGER.info("Connected to Marantz receiver on %s", self._port)
 
