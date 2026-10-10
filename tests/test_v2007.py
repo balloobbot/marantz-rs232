@@ -10,6 +10,7 @@ import pytest
 
 import marantz_rs232.v2007.receiver as v2007_receiver
 from marantz_rs232 import (
+    MarantzConnectionError,
     V2007ReceiverState,
     V2007Source,
     V2007SurroundCode,
@@ -573,6 +574,135 @@ async def test_disconnect_notifies_subscribers_with_none(
 
     assert updates[-1] is None
     assert not receiver.connected
+
+
+def _break_transport(mock: _MockSerial) -> OSError:
+    """Make the mock transport behave like a serial link that has gone away.
+
+    Writes fail, and so does ``wait_closed()``: serialx re-raises the error
+    that broke the connection when the stream is closed afterwards.
+    """
+    err = OSError(5, "ESPHome API connection closed")
+    mock.writer.write.side_effect = err
+    mock.writer.wait_closed.side_effect = err
+    return err
+
+
+async def test_write_error_on_broken_transport_tears_down(
+    receiver: MarantzV2007Receiver, mock_serial: _MockSerial
+) -> None:
+    """A transport that also fails on close must not leave a dead writer behind."""
+    updates: list[V2007ReceiverState | None] = []
+    receiver.subscribe(updates.append)
+    err = _break_transport(mock_serial)
+
+    with pytest.raises(MarantzConnectionError) as exc_info:
+        await receiver.main.power_on()
+
+    assert exc_info.value.__cause__ is err
+    assert not receiver.connected
+    assert receiver._writer is None
+    assert receiver._read_task is None
+    assert updates == [None]
+
+    # Later commands fail fast instead of writing to the dead stream again.
+    mock_serial.writer.write.reset_mock()
+    with pytest.raises(MarantzConnectionError, match="Not connected"):
+        await receiver.main.power_on()
+    with pytest.raises(MarantzConnectionError, match="Not connected"):
+        await receiver.main.query_power()
+    mock_serial.writer.write.assert_not_called()
+
+
+async def test_read_error_on_broken_transport_tears_down(
+    receiver: MarantzV2007Receiver, mock_serial: _MockSerial
+) -> None:
+    """The read loop must finish cleanly even when closing the transport fails."""
+    updates: list[V2007ReceiverState | None] = []
+    receiver.subscribe(updates.append)
+    read_task = receiver._read_task
+    assert read_task is not None
+    err = _break_transport(mock_serial)
+
+    mock_serial.reader.set_exception(err)
+    await read_task
+
+    assert not receiver.connected
+    assert receiver._writer is None
+    assert updates == [None]
+
+
+async def test_link_loss_fails_query_in_flight(
+    receiver: MarantzV2007Receiver, mock_serial: _MockSerial
+) -> None:
+    """A dropped link fails the pending query instead of timing out."""
+    mock_serial.writer.write.side_effect = lambda _data: mock_serial.reader.feed_eof()
+
+    with pytest.raises(MarantzConnectionError, match="Connection lost"):
+        await receiver.main.query_power()
+
+    assert not receiver.connected
+
+
+async def test_read_loop_crash_tears_down(
+    receiver: MarantzV2007Receiver,
+    mock_serial: _MockSerial,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unexpected error in the read loop disconnects instead of hanging."""
+    disconnected = asyncio.Event()
+    receiver.subscribe(lambda state: state is None and disconnected.set())
+
+    with patch.object(receiver, "_process_line", side_effect=RuntimeError("boom")):
+        mock_serial.feed("VOL:-20")
+        await disconnected.wait()
+
+    assert not receiver.connected
+    assert "Read loop failed" in caplog.text
+
+
+async def test_connect_when_connected_raises(
+    receiver: MarantzV2007Receiver, mock_serial: _MockSerial
+) -> None:
+    """A second connect() must not replace and leak the open connection."""
+    with (
+        patch(
+            "marantz_rs232.v2007.receiver.serialx.open_serial_connection"
+        ) as mock_open,
+        pytest.raises(RuntimeError, match="Already connected"),
+    ):
+        await receiver.connect()
+
+    mock_open.assert_not_called()
+    mock_serial.writer.close.assert_not_called()
+    assert receiver.connected
+    await receiver.main.power_on()
+
+
+async def test_unsubscribe_twice_is_noop(
+    receiver: MarantzV2007Receiver, mock_serial: _MockSerial
+) -> None:
+    updates: list[V2007ReceiverState | None] = []
+    unsubscribe = receiver.subscribe(updates.append)
+
+    unsubscribe()
+    unsubscribe()
+
+    mock_serial.feed("VOL:-20")
+    await asyncio.sleep(0.01)
+    assert updates == []
+
+
+async def test_unsubscribe_during_callback_keeps_other_subscribers(
+    receiver: MarantzV2007Receiver, mock_serial: _MockSerial
+) -> None:
+    updates: list[V2007ReceiverState | None] = []
+    unsubscribe = receiver.subscribe(lambda _state: unsubscribe())
+    receiver.subscribe(updates.append)
+
+    mock_serial.feed("VOL:-20")
+    await asyncio.sleep(0.01)
+    assert len(updates) == 1
 
 
 # -- Phase 2: extended commands ---------------------------------------------

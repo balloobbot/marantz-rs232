@@ -16,6 +16,7 @@ All public symbols are prefixed with `V2003`, `V2007`, or `V2015` to keep the th
 src/marantz_rs232/
   __init__.py    -- Public API surface re-exporting both protocols + `probe()`
   probe.py       -- async probe(port) — sniffs first response byte to pick protocol
+  exceptions.py  -- MarantzConnectionError, shared by all protocols
   __main__.py    -- CLI: python -m marantz_rs232 PORT [--v2007] [--v2003] [--detect] [--model M]
   v2015/         -- Modern (2015-era) protocol implementation
     __init__.py
@@ -94,6 +95,7 @@ docs/
 - Tuner (v2007) packs band into a 5-digit numeric value: `xxxxx<256` is XM channel, `<2000` is AM kHz, `>=2000` is FM in 10 kHz units.
 - `_V2015_SINGLE_RESPONSE_PREFIXES` / `_V2015_MULTI_RESPONSE_PREFIXES` split queries that block on response from those that fire-and-forget.
 - `probe_sources()` (v2015) tries each `V2015InputSource`, restores the original at end.
+- `MarantzConnectionError` (a `ConnectionError`) means the link is not open or was lost: not connected, a failed write, or a teardown while a request waits for its response. A lost link tears down the connection and notifies subscribers with `None`. `connect()` on v2015/v2007 raises `RuntimeError` when already connected.
 - `probe(port)` (top-level) is two-phase: phase 1 opens at 9600 baud and sends `@PWR:?\r` + `PW?\r` (first byte `@` → v2007, otherwise v2015); if no response, phase 2 reopens at 4800 baud with RTS/CTS and sends `@1?A\r` to detect v2003.
 - Module-level timeouts (`V2015_MULTI_RESPONSE_DELAY`, `V2015_PROBE_TIMEOUT`, `V2007_COMMAND_TIMEOUT`, `V2003_COMMAND_TIMEOUT`) are overridden in test modules for speed.
 

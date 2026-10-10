@@ -1,5 +1,6 @@
 """Async library to control Marantz receivers over RS232 using serialx."""
 
+from .exceptions import MarantzConnectionError
 from .probe import probe
 from .v2003 import (
     MarantzV2003Receiver,
@@ -113,6 +114,7 @@ from .v2015 import (
 )
 
 __all__ = [
+    "MarantzConnectionError",
     "MarantzV2003Receiver",
     "MarantzV2007Receiver",
     "MarantzV2015Receiver",
