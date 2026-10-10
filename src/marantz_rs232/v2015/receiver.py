@@ -60,6 +60,8 @@ class MarantzV2015Receiver:
 
     def __init__(self, port: str) -> None:
         self._port = port
+        # ESPHome proxy URLs can carry the API key in the query string
+        self._log_port = port.split("?", 1)[0]
         self._reader: asyncio.StreamReader | None = None
         self._writer: serialx.SerialStreamWriter | None = None
         self._read_task: asyncio.Task | None = None
@@ -148,13 +150,13 @@ class MarantzV2015Receiver:
         except TimeoutError:
             await self.disconnect()
             raise ConnectionError(
-                f"No response from receiver on {self._port}"
+                f"No response from receiver on {self._log_port}"
             ) from None
         except BaseException:
             await self.disconnect()
             raise
 
-        _LOGGER.info("Connected to Marantz receiver on %s", self._port)
+        _LOGGER.info("Connected to Marantz receiver on %s", self._log_port)
 
     async def disconnect(self) -> None:
         await self._teardown()

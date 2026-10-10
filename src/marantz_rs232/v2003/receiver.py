@@ -130,6 +130,8 @@ class MarantzV2003Receiver:
         if not (len(device_id) == 1 and device_id in "0123456789"):
             raise ValueError(f"device_id must be a single digit '0'..'9', got {device_id!r}")
         self._port = port
+        # ESPHome proxy URLs can carry the API key in the query string
+        self._log_port = port.split("?", 1)[0]
         self._device_id = device_id
         self._reader: asyncio.StreamReader | None = None
         self._writer: serialx.SerialStreamWriter | None = None  # type: ignore[type-arg]
@@ -163,12 +165,12 @@ class MarantzV2003Receiver:
             power = await self._query("A")
             if power not in POWER_STATUS_CODES:
                 raise ConnectionError(
-                    f"Invalid power response from receiver on {self._port}: {power!r}"
+                    f"Invalid power response from receiver on {self._log_port}: {power!r}"
                 )
         except TimeoutError as err:
             await self.disconnect()
             raise ConnectionError(
-                f"No response from v2003 receiver on {self._port}: {err}"
+                f"No response from v2003 receiver on {self._log_port}: {err}"
             ) from err
         except BaseException:
             await self.disconnect()

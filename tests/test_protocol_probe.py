@@ -59,6 +59,30 @@ async def test_probe_raises_on_silent_port() -> None:
             await probe("/dev/ttyUSB0", timeout=0.1)
 
 
+async def test_probe_error_keeps_api_key_out_of_message() -> None:
+    reader = asyncio.StreamReader()
+    writer = MagicMock()
+    writer.write = MagicMock()
+    writer.drain = AsyncMock()
+    writer.close = MagicMock()
+    writer.wait_closed = AsyncMock()
+
+    async def fake_open(*_a, **_kw):
+        return reader, writer
+
+    with patch(
+        "marantz_rs232.probe.serialx.open_serial_connection",
+        side_effect=fake_open,
+    ):
+        with pytest.raises(ConnectionError) as exc_info:
+            await probe(
+                "esphome://proxy.local:6053/?port_name=RS232&key=SECRET",
+                timeout=0.1,
+            )
+
+    assert "SECRET" not in str(exc_info.value)
+
+
 async def test_probe_sends_both_protocol_queries() -> None:
     """Both queries must be sent so whichever protocol is on the wire can answer."""
     reader = asyncio.StreamReader()
